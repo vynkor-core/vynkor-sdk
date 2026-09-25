@@ -1,6 +1,6 @@
 [package]
 name = "vynkor-sdk"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.85"
 description = "Rust SDK for writing Vynkor plugins — async IPC client (UDS + WebSocket), Plugin trait, and full Vynkor wire protocol (framing, zstd compression, HMAC frame MACs, fragmentation, raw audio)."
