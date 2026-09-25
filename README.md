@@ -111,8 +111,12 @@ async fn main() -> Result<(), VynkorError> {
 }
 ```
 
-JWT credentials come from the same env vars as the UDS path — the token is
-presented both in the `Sec-WebSocket-Protocol: vynkor, <jwt>` handshake header
+A **paired device** (E-01) sets `VYN_DEVICE_ID` + `VYN_DEVICE_SECRET`, both
+issued by `vyn device connect` on the host: registration carries `device_id`
+and the frame MAC keys off the device's own secret, so the host master
+`jwt_secret` never leaves the host. `run_ws` refuses a half-set pair, and
+refuses `VYN_JWT_SECRET` set next to a device pair. Without a device pair
+the legacy `VYN_JWT_SECRET` path applies. The token is presented both in the `Sec-WebSocket-Protocol: vynkor, <jwt>` handshake header
 and in the registration envelope. Registration, frame-MAC enable and reconnect
 behave exactly like the UDS client. Two differences are dictated by the
 gateway (R5-03): outbound frames are never zstd-compressed and never
@@ -126,6 +130,8 @@ passes unchanged.
 | `VYN_SOCKET_PATH` | Kernel UDS path. Default: `XDG_RUNTIME_DIR` → `/run/user/<uid>` → `~/.local/state/vyn/run` (never shared `/tmp`). |
 | `VYN_JWT_TOKEN`   | JWT presented at registration (required on secured kernels).   |
 | `VYN_JWT_SECRET`  | Shared secret; enables per-frame HMAC-SHA256 tags after registration. |
+| `VYN_DEVICE_ID`   | Paired device id (`run_ws` only, E-01). Requires `VYN_DEVICE_SECRET`. |
+| `VYN_DEVICE_SECRET` | Paired device's own MAC secret (`run_ws` only, E-01); replaces `VYN_JWT_SECRET`. |
 
 ## Protocol coverage
 
@@ -178,8 +184,10 @@ client.close_session(&action_id, "done").await?;
 Over WebSocket, connect with the gateway URL instead — same API afterwards:
 
 ```rust,ignore
-let mut client = VynkorClient::connect_ws("ws://host:8080/ws", &jwt, Some(secret)).await?;
-let ack = client.register_with_token("device.geo", manifest, &jwt).await?;
+// paired device (E-01): token + device_secret from `vyn device connect`
+let mut client =
+    VynkorClient::connect_ws_device("ws://host:8080/ws", &jwt, "phone-1", device_secret).await?;
+let ack = client.register_with_token("phone-1", manifest, &jwt).await?;
 ```
 
 `publish_event` requires `PERMISSION_EVENT_PUBLISH`; `timeout_ms == 0` uses

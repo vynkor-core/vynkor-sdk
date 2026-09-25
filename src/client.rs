@@ -7,7 +7,8 @@
 //!   [`VynkorClient::connect_with_secret`].
 //! - **WebSocket** — the kernel's WS gateway (`ws://host:port/ws`) via
 //!   [`VynkorClient::connect_ws`], for remote devices (see the Remote Devices
-//!   roadmap, D-05). Registration, frame-MAC enable and reconnect mirror the
+//!   roadmap, D-05). Paired devices use [`VynkorClient::connect_ws_device`]
+//!   with their own `device_secret` (E-01). Registration, frame-MAC enable and reconnect mirror the
 //!   UDS client exactly; the only differences are dictated by the gateway
 //!   (R5-03): outbound frames are never zstd-compressed and never fragmented,
 //!   while `FLAG_RAW_BINARY` passes unchanged.
@@ -167,8 +168,12 @@ fn ws_io_error<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> Vynko
 /// [`VynkorClient::register_with_token`] before any other traffic.
 pub struct VynkorClient {
     transport: Transport,
-    /// Shared JWT secret, needed to derive the frame-MAC key. None => no MAC.
+    /// MAC key material: the host's shared JWT secret for local plugins, or
+    /// the paired device's own secret (E-01). None => no MAC.
     secret: Option<Vec<u8>>,
+    /// Sent in `PluginRegister.device_id`. Set => kernel keys the MAC off the
+    /// device's credential row, not the master secret (E-01).
+    device_id: Option<String>,
     /// Per-connection MAC key, set after a secured registration.
     session_key: Option<[u8; 32]>,
     /// Inbound fragment reassembly buffers, keyed by stream_id.
@@ -213,6 +218,7 @@ impl VynkorClient {
         Self {
             transport: Transport::Uds { read, write },
             secret,
+            device_id: None,
             session_key: None,
             reassembly: HashMap::new(),
             next_stream_id: 1,
@@ -254,10 +260,36 @@ impl VynkorClient {
         Ok(Self {
             transport: Transport::Ws(Box::new(ws)),
             secret: secret.map(|s| s.to_vec()),
+            device_id: None,
             session_key: None,
             reassembly: HashMap::new(),
             next_stream_id: 1,
         })
+    }
+
+    /// Connect a paired remote device (E-01) to the kernel's WS gateway.
+    ///
+    /// `jwt_token` and `device_secret` are the pair issued by
+    /// `vyn device connect`; the master `jwt_secret` never leaves the host.
+    /// Registration carries `device_id`, so the kernel checks the token's
+    /// `sub` against it and derives the frame-MAC key from `device_secret`.
+    pub async fn connect_ws_device(
+        url: &str,
+        jwt_token: &str,
+        device_id: &str,
+        device_secret: &[u8],
+    ) -> Result<Self, VynkorError> {
+        Ok(Self::connect_ws(url, jwt_token, Some(device_secret))
+            .await?
+            .with_device_id(device_id))
+    }
+
+    /// Mark this connection as belonging to a paired device: registration
+    /// sends `device_id`, and the secret given at connect time must be that
+    /// device's `device_secret`, not the host `jwt_secret`.
+    pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = Some(device_id.into());
+        self
     }
 
     async fn connect_inner(
@@ -313,6 +345,7 @@ impl VynkorClient {
                 version: version.to_string(),
                 manifest: Some(manifest),
                 jwt_token: jwt_token.to_string(),
+                device_id: self.device_id.clone().unwrap_or_default(),
                 ..Default::default()
             })),
             ..Default::default()
