@@ -53,9 +53,13 @@
 //! | `VYN_SOCKET_PATH` | Kernel UDS path (default: per-user runtime dir)            |
 //! | `VYN_JWT_TOKEN`   | JWT presented at registration (secured kernels)            |
 //! | `VYN_JWT_SECRET`  | Shared secret; enables per-frame HMAC-SHA256 tags          |
+//! | `VYN_DEVICE_ID`   | Paired device id (WS only, E-01)                           |
+//! | `VYN_DEVICE_SECRET` | Paired device's own MAC secret (WS only, E-01)           |
 //!
-//! The same `VYN_JWT_TOKEN` / `VYN_JWT_SECRET` drive
-//! [`Plugin::run_ws`](crate::Plugin::run_ws), which connects over WebSocket.
+//! [`Plugin::run_ws`](crate::Plugin::run_ws) connects over WebSocket. A
+//! paired remote device sets `VYN_DEVICE_ID` + `VYN_DEVICE_SECRET` (from
+//! `vyn device connect`) instead of `VYN_JWT_SECRET` — the host master
+//! secret never has to leave the host.
 //!
 //! ## Protocol coverage
 //!

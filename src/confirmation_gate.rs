@@ -32,7 +32,7 @@
 //!     "Move money between accounts",
 //!     r#"{"type":"object"}"#,
 //!     ActionRisk::Critical,
-//!     &["device.phone"], // only the user's device may confirm
+//!     &["phone-1"], // only the user's paired device may confirm
 //! )?;
 //!
 //! let (actions, action_specs) = gate.manifest_entries();
@@ -42,10 +42,12 @@
 //! # Ok::<(), String>(())
 //! ```
 //!
-//! The allowlist supports a trailing `.*` suffix: `"device.*"` matches any
-//! caller whose plugin id starts with `device.` (the D-06 bridge mirrors a
-//! client capability as `device.<cap>`, so a phone agent shows up as
-//! `device.phone`, `device.geo`, …).
+//! Callers are kernel-stamped plugin ids. A paired device registers as its
+//! `<device_id>` (single-WS, e.g. `phone-1`); legacy per-capability
+//! registrations show up as `<device_id>.<cap>` (`phone-1.geo`, …). The
+//! allowlist supports a trailing `.*` suffix: `"phone-1.*"` matches every
+//! `phone-1.<cap>` but not the bare `phone-1` — list both to cover either
+//! registration style.
 //!
 //! # Caller side
 //!
@@ -286,8 +288,8 @@ impl ConfirmationGate {
     }
 
     /// Whether `caller_plugin_id` is on the confirm allowlist (exact match or
-    /// `prefix.*` glob — the glob keeps the dot, so `device.*` matches
-    /// `device.phone` but not `devices.phone`).
+    /// `prefix.*` glob — the glob keeps the dot, so `phone-1.*` matches
+    /// `phone-1.geo` but neither `phone-10.geo` nor the bare `phone-1`).
     pub fn may_confirm(&self, caller_plugin_id: &str) -> bool {
         self.confirm_callers.iter().any(|allowed| {
             if let Some(prefix) = allowed.strip_suffix(".*") {
@@ -438,7 +440,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_stores_pending_and_returns_pending_id() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let resp = run(
             &g,
             request(
@@ -459,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn any_caller_can_request_even_one_not_allowed_to_confirm() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let resp = run(
             &g,
             request(
@@ -475,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_caller_confirms_and_executes_stored_params() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let pending_id = run(
             &g,
             request(
@@ -497,7 +499,7 @@ mod tests {
             request(
                 "confirm_transfer",
                 "a2",
-                "device.phone",
+                "phone-1",
                 confirm_params.as_bytes(),
             ),
         )
@@ -512,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn unapproved_caller_is_denied_even_for_a_real_pending_id() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let pending_resp = run(
             &g,
             request("request_transfer", "a1", "ai", br#"{"amount": 1}"#),
@@ -551,15 +553,10 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_glob_matches_all_sub_devices() {
-        let g = gate(&["device.*"]);
+        let g = gate(&["phone-1.*"]);
         let resp = run(
             &g,
-            request(
-                "request_transfer",
-                "a1",
-                "device.phone",
-                br#"{"amount": 1}"#,
-            ),
+            request("request_transfer", "a1", "phone-1.mic", br#"{"amount": 1}"#),
         )
         .await;
         let pending_id: serde_json::Value = serde_json::from_slice(&resp.data_json).unwrap();
@@ -572,7 +569,7 @@ mod tests {
                 request(
                     "confirm_transfer",
                     "a2",
-                    "device.geo", // any device.* mirror may confirm
+                    "phone-1.geo", // any phone-1.* mirror may confirm
                     confirm_params.as_bytes(),
                 ),
             )
@@ -595,13 +592,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_or_missing_pending_id_errors() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let resp = run(
             &g,
             request(
                 "confirm_transfer",
                 "a1",
-                "device.phone",
+                "phone-1",
                 br#"{"pending_id": "pending-does-not-exist"}"#,
             ),
         )
@@ -610,18 +607,14 @@ mod tests {
         assert!(resp.error.contains("no pending transfer request"));
 
         // Malformed params (missing pending_id).
-        let resp = run(
-            &g,
-            request("confirm_transfer", "a2", "device.phone", br#"{}"#),
-        )
-        .await;
+        let resp = run(&g, request("confirm_transfer", "a2", "phone-1", br#"{}"#)).await;
         assert_eq!(resp.status, ActionStatus::ActionError as i32);
         assert!(resp.error.contains("pending_id"));
     }
 
     #[tokio::test]
     async fn expired_pending_is_swept_and_cannot_be_confirmed() {
-        let g = gate(&["device.phone"]).with_pending_ttl(Duration::from_millis(10));
+        let g = gate(&["phone-1"]).with_pending_ttl(Duration::from_millis(10));
         let resp = run(
             &g,
             request("request_transfer", "a1", "ai", br#"{"amount": 1}"#),
@@ -639,7 +632,7 @@ mod tests {
             request(
                 "confirm_transfer",
                 "a2",
-                "device.phone",
+                "phone-1",
                 confirm_params.as_bytes(),
             ),
         )
@@ -651,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_actions_get_action_not_found() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let resp = run(&g, request("do_something_else", "a1", "ai", b"{}")).await;
         assert_eq!(resp.status, ActionStatus::ActionNotFound as i32);
         // Cross-op requests are not routed by this gate either.
@@ -661,7 +654,7 @@ mod tests {
 
     #[test]
     fn manifest_entries_carry_confirmation_metadata() {
-        let g = gate(&["device.phone"]);
+        let g = gate(&["phone-1"]);
         let (actions, specs) = g.manifest_entries();
         assert_eq!(actions, vec!["request_transfer", "confirm_transfer"]);
 
@@ -693,16 +686,17 @@ mod tests {
 
     #[test]
     fn confirm_allowlist_matches_exact_and_glob() {
-        let g = gate(&["device.phone", "host-ui"]);
-        assert!(g.may_confirm("device.phone"));
+        let g = gate(&["phone-1", "host-ui"]);
+        assert!(g.may_confirm("phone-1"));
         assert!(g.may_confirm("host-ui"));
-        assert!(!g.may_confirm("device.geo"));
+        assert!(!g.may_confirm("phone-1.geo"));
         assert!(!g.may_confirm("ai"));
 
-        let g = gate(&["device.*"]);
-        assert!(g.may_confirm("device.phone"));
-        assert!(g.may_confirm("device.geo"));
-        assert!(!g.may_confirm("device_phone"), "prefix boundary is the dot");
+        let g = gate(&["phone-1.*"]);
+        assert!(g.may_confirm("phone-1.mic"));
+        assert!(g.may_confirm("phone-1.geo"));
+        assert!(!g.may_confirm("phone-10.geo"), "prefix boundary is the dot");
+        assert!(!g.may_confirm("phone-1"), "glob does not cover the bare id");
         assert!(!g.may_confirm("ai"));
     }
 }

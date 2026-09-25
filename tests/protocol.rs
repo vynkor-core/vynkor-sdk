@@ -142,6 +142,85 @@ async fn mac_secured_registration_and_tagged_frames() {
 }
 
 #[tokio::test]
+async fn device_registration_sends_device_id_and_macs_with_device_secret() {
+    // E-01: a paired device keys its MAC off its own secret, never the
+    // host master; the kernel only takes that path when device_id is sent
+    let device_secret = b"per-device-secret-from-pairing";
+    let plugin_id = "phone-1";
+
+    let (a, mut kernel_side) = UnixStream::pair().unwrap();
+    let mut client =
+        VynkorClient::from_stream(a, Some(device_secret.to_vec())).with_device_id("phone-1");
+
+    let kernel = tokio::spawn(async move {
+        let reg = read_frame(&mut kernel_side).await.unwrap();
+        match decode(&reg).payload {
+            Some(envelope::Payload::PluginRegister(r)) => assert_eq!(r.device_id, "phone-1"),
+            other => panic!("expected PluginRegister, got {other:?}"),
+        }
+
+        let ack = Envelope {
+            payload: Some(envelope::Payload::PluginRegisterAck(PluginRegisterAck {
+                accepted: true,
+                session_nonce: b"0123456789abcdef".to_vec(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ack.encode(&mut buf).unwrap();
+        let mut target = [0u8; 32];
+        target[..plugin_id.len()].copy_from_slice(plugin_id.as_bytes());
+        let frame = Frame {
+            magic: 0x5652,
+            flags: 0,
+            length: buf.len() as u32,
+            target,
+            crc32: crc32fast::hash(&buf),
+            payload: buf.into(),
+            mac: None,
+        };
+        write_frame_raw(&mut kernel_side, &frame).await.unwrap();
+
+        let secured = read_frame(&mut kernel_side).await.unwrap();
+        let key = derive_session_key(device_secret, b"0123456789abcdef", plugin_id);
+        let tag = secured.mac.expect("tag missing");
+        assert!(
+            verify_tag(&key, &serialize_header(&secured), &secured.payload, &tag),
+            "MAC not keyed by the device secret"
+        );
+    });
+
+    client
+        .register(plugin_id, PluginManifest::default())
+        .await
+        .unwrap();
+    assert!(client.is_secured());
+    client.subscribe(vec!["*".into()]).await.unwrap();
+    kernel.await.unwrap();
+}
+
+#[tokio::test]
+async fn local_registration_leaves_device_id_empty() {
+    let (a, mut kernel_side) = UnixStream::pair().unwrap();
+    let mut client = VynkorClient::from_stream(a, None);
+    let kernel = tokio::spawn(async move {
+        let reg = read_frame(&mut kernel_side).await.unwrap();
+        match decode(&reg).payload {
+            Some(envelope::Payload::PluginRegister(r)) => assert!(r.device_id.is_empty()),
+            other => panic!("expected PluginRegister, got {other:?}"),
+        }
+    });
+    // no ack comes back; only the outbound register frame matters here
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        client.register("local-plugin", PluginManifest::default()),
+    )
+    .await;
+    kernel.await.unwrap();
+}
+
+#[tokio::test]
 async fn recv_rejects_untagged_frame_when_secured() {
     let secret = b"s3cret";
     let (a, mut kernel_side) = UnixStream::pair().unwrap();

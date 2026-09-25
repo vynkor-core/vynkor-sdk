@@ -96,16 +96,28 @@ pub trait Plugin {
 
     /// Connect to a kernel WebSocket gateway (D-05), register and serve until
     /// shutdown — the WS mirror of [`Plugin::run_with`] for remote devices.
-    /// JWT credentials come from the same env vars as the UDS path
-    /// (`VYN_JWT_TOKEN` / `VYN_JWT_SECRET`); the token is presented both
-    /// in the `Sec-WebSocket-Protocol` handshake header and in the
-    /// registration envelope.
+    ///
+    /// A paired device (E-01) sets `VYN_DEVICE_ID` + `VYN_DEVICE_SECRET`
+    /// (both issued by `vyn device connect`); registration then carries
+    /// `device_id` and the frame MAC keys off the device's own secret.
+    /// Without them the legacy `VYN_JWT_SECRET` path applies. The token
+    /// (`VYN_JWT_TOKEN`) is presented both in the `Sec-WebSocket-Protocol`
+    /// handshake header and in the registration envelope.
     async fn run_ws(&mut self, url: &str) -> Result<(), VynkorError> {
         let token = env::var("VYN_JWT_TOKEN").unwrap_or_default();
-        let secret = env::var("VYN_JWT_SECRET").ok().filter(|s| !s.is_empty());
-        let client = match &secret {
-            Some(s) => VynkorClient::connect_ws(url, &token, Some(s.as_bytes())).await?,
-            None => VynkorClient::connect_ws(url, &token, None).await?,
+        let creds = resolve_ws_credentials(
+            non_empty_env("VYN_DEVICE_ID"),
+            non_empty_env("VYN_DEVICE_SECRET"),
+            non_empty_env("VYN_JWT_SECRET"),
+        )?;
+        let client = match creds {
+            WsCredentials::Device { device_id, secret } => {
+                VynkorClient::connect_ws_device(url, &token, &device_id, secret.as_bytes()).await?
+            }
+            WsCredentials::Shared(secret) => {
+                VynkorClient::connect_ws(url, &token, Some(secret.as_bytes())).await?
+            }
+            WsCredentials::None => VynkorClient::connect_ws(url, &token, None).await?,
         };
         self.serve(client, &token).await
     }
@@ -179,6 +191,104 @@ pub trait Plugin {
         match handler_err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// MAC credentials for [`Plugin::run_ws`], picked from the environment.
+#[derive(Debug, PartialEq, Eq)]
+enum WsCredentials {
+    /// Paired device (E-01): register with `device_id`, MAC off `secret`.
+    Device { device_id: String, secret: String },
+    /// Legacy: host master `jwt_secret` (local plugins, pre-E-01 devices).
+    Shared(String),
+    /// Unsecured kernel (`allow_no_auth`).
+    None,
+}
+
+/// Decide which credential `run_ws` uses. Inputs are the non-empty
+/// `VYN_DEVICE_ID` / `VYN_DEVICE_SECRET` / `VYN_JWT_SECRET` values.
+///
+/// Strict on purpose: a half-set device pair or a master secret next to a
+/// device pair is a misconfiguration, reported here instead of as an opaque
+/// "token plugin_id mismatch" from the kernel.
+fn resolve_ws_credentials(
+    device_id: Option<String>,
+    device_secret: Option<String>,
+    jwt_secret: Option<String>,
+) -> Result<WsCredentials, VynkorError> {
+    match (device_id, device_secret, jwt_secret) {
+        // E-01: the master secret must never reach a paired device
+        (Some(_), Some(_), Some(_)) => Err(VynkorError::Internal(
+            "VYN_JWT_SECRET is set alongside VYN_DEVICE_ID/VYN_DEVICE_SECRET — \
+             a paired device must not hold the host master secret; unset it"
+                .into(),
+        )),
+        (Some(device_id), Some(secret), None) => Ok(WsCredentials::Device { device_id, secret }),
+        (Some(_), None, _) => Err(VynkorError::Internal(
+            "VYN_DEVICE_ID is set without VYN_DEVICE_SECRET".into(),
+        )),
+        (None, Some(_), _) => Err(VynkorError::Internal(
+            "VYN_DEVICE_SECRET is set without VYN_DEVICE_ID".into(),
+        )),
+        (None, None, Some(secret)) => Ok(WsCredentials::Shared(secret)),
+        (None, None, None) => Ok(WsCredentials::None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn device_pair_selects_device_credentials() {
+        assert_eq!(
+            resolve_ws_credentials(s("phone-1"), s("dev-secret"), None).unwrap(),
+            WsCredentials::Device {
+                device_id: "phone-1".into(),
+                secret: "dev-secret".into()
+            }
+        );
+    }
+
+    #[test]
+    fn master_secret_alone_is_legacy_shared() {
+        assert_eq!(
+            resolve_ws_credentials(None, None, s("master")).unwrap(),
+            WsCredentials::Shared("master".into())
+        );
+    }
+
+    #[test]
+    fn nothing_set_is_unsecured() {
+        assert_eq!(
+            resolve_ws_credentials(None, None, None).unwrap(),
+            WsCredentials::None
+        );
+    }
+
+    #[test]
+    fn master_secret_next_to_device_pair_is_rejected() {
+        let err = resolve_ws_credentials(s("phone-1"), s("dev-secret"), s("master"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VYN_JWT_SECRET"), "{err}");
+    }
+
+    #[test]
+    fn half_device_pair_is_rejected_even_with_master_fallback() {
+        for (id, secret) in [(s("phone-1"), None), (None, s("dev-secret"))] {
+            assert!(resolve_ws_credentials(id.clone(), secret.clone(), None).is_err());
+            // no silent downgrade to the shared path
+            assert!(resolve_ws_credentials(id, secret, s("master")).is_err());
         }
     }
 }
