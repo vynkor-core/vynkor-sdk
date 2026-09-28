@@ -36,7 +36,8 @@ use tokio::sync::mpsc;
 
 use crate::client::VynkorClient;
 use crate::proto::{
-    envelope, ActionRequest, ActionResponse, ActionStatus, Envelope, Event, PluginManifest, Pong,
+    envelope, ActionRequest, ActionResponse, ActionResponseChunk, ActionStatus, Envelope, Event,
+    PluginManifest, Pong, SessionClose,
 };
 use crate::VynkorError;
 
@@ -70,6 +71,82 @@ pub fn response_envelope(action_id: String, result: Result<Vec<u8>, String>) -> 
     Envelope {
         payload: Some(envelope::Payload::ActionResponse(response)),
         ..Default::default()
+    }
+}
+
+/// Provider-side outlet for a streaming reply (CD-03).
+///
+/// Envelopes pushed here reach the kernel through the same channel as final
+/// replies, in push order, while the handler is still running — so a
+/// handler can emit a response incrementally instead of returning it all at
+/// the end.
+///
+/// Kernel session contract for an `ActionRequest{streaming: true}`:
+/// 1. [`ResponseSink::accept`] — `ActionResponse{ACTION_OK}` opens the
+///    session (the kernel keeps the pending action alive instead of
+///    evicting it, and forwards the response to the requester);
+/// 2. any number of [`ResponseSink::chunk`]s, `seq` increasing from 0;
+/// 3. [`ResponseSink::close`] — `SessionClose` ends the stream normally.
+///    A second `ActionResponse{ACTION_OK}` does *not* end it.
+///
+/// To fail after accepting, send an error `ActionResponse` (e.g.
+/// [`response_envelope`] with `Err`); the kernel evicts the session and
+/// forwards the error. The requester cancels with its own `SessionClose`,
+/// which arrives at [`ConcurrentHandler::on_message`] addressed by the same
+/// `action_id` the handler saw.
+#[derive(Clone)]
+pub struct ResponseSink {
+    tx: mpsc::Sender<Envelope>,
+}
+
+impl ResponseSink {
+    /// Queue one envelope for the kernel. Waits while the loop's channel is
+    /// full, so a fast producer is paced by the connection. `Err` means the
+    /// loop has exited — stop producing.
+    pub async fn send(&self, envelope: Envelope) -> Result<(), VynkorError> {
+        self.tx
+            .send(envelope)
+            .await
+            .map_err(|_| VynkorError::Internal("concurrent loop closed".into()))
+    }
+
+    /// Open the streaming session (`ActionResponse{ACTION_OK}`); `data_json`
+    /// is optional metadata the requester sees with the acceptance.
+    pub async fn accept(&self, action_id: &str, data_json: Vec<u8>) -> Result<(), VynkorError> {
+        self.send(response_envelope(action_id.to_string(), Ok(data_json)))
+            .await
+    }
+
+    /// One `ActionResponseChunk` of an accepted session.
+    pub async fn chunk(
+        &self,
+        action_id: &str,
+        seq: u32,
+        chunk: Vec<u8>,
+    ) -> Result<(), VynkorError> {
+        self.send(Envelope {
+            payload: Some(envelope::Payload::ActionResponseChunk(
+                ActionResponseChunk {
+                    action_id: action_id.to_string(),
+                    seq,
+                    chunk,
+                },
+            )),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// End an accepted session (`SessionClose`), e.g. with reason `"done"`.
+    pub async fn close(&self, action_id: &str, reason: &str) -> Result<(), VynkorError> {
+        self.send(Envelope {
+            payload: Some(envelope::Payload::SessionClose(SessionClose {
+                action_id: action_id.to_string(),
+                reason: reason.to_string(),
+            })),
+            ..Default::default()
+        })
+        .await
     }
 }
 
@@ -127,7 +204,32 @@ pub trait ConcurrentHandler: Send + Sync + 'static {
     /// publish sent only after the response). A panic inside this method
     /// is caught and converted into an `ACTION_ERROR` reply for the
     /// request's `action_id`, so no reply is ever dropped on the floor.
-    fn on_action(&self, req: ActionRequest) -> impl Future<Output = Vec<Envelope>> + Send;
+    ///
+    /// Defaults to an `ACTION_ERROR` so a handler that only implements
+    /// [`ConcurrentHandler::on_action_stream`] need not stub this out.
+    fn on_action(&self, req: ActionRequest) -> impl Future<Output = Vec<Envelope>> + Send {
+        async move {
+            vec![response_envelope(
+                req.action_id,
+                Err("on_action not implemented".into()),
+            )]
+        }
+    }
+
+    /// What the loop actually calls for each inbound request. Override it
+    /// to reply incrementally through `sink` (see [`ResponseSink`] for the
+    /// session contract); the returned envelopes are sent after everything
+    /// already pushed to `sink`. The default ignores `sink` and delegates
+    /// to [`ConcurrentHandler::on_action`]. Panics are handled the same
+    /// way: the request still gets an `ACTION_ERROR`.
+    fn on_action_stream(
+        &self,
+        req: ActionRequest,
+        sink: ResponseSink,
+    ) -> impl Future<Output = Vec<Envelope>> + Send {
+        let _ = sink;
+        self.on_action(req)
+    }
 
     /// Called for each inbound [`Event`] the kernel delivers. Returning
     /// `Ok(..)` makes the loop send an `EventAck` so the kernel stops
@@ -299,7 +401,8 @@ fn spawn_handler<H: ConcurrentHandler>(
     tokio::spawn(async move {
         let inner = handler.clone();
         let action_id = req.action_id.clone();
-        let join = tokio::spawn(async move { inner.on_action(req).await });
+        let sink = ResponseSink { tx: tx.clone() };
+        let join = tokio::spawn(async move { inner.on_action_stream(req, sink).await });
         let envelopes = match join.await {
             Ok(envelopes) => envelopes,
             Err(join_err) => {

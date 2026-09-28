@@ -76,7 +76,9 @@ pub mod framing;
 pub mod plugin;
 
 pub use client::VynkorClient;
-pub use concurrent::{response_envelope, run_concurrent_loop, serve_concurrent, ConcurrentHandler};
+pub use concurrent::{
+    response_envelope, run_concurrent_loop, serve_concurrent, ConcurrentHandler, ResponseSink,
+};
 pub use confirmation_gate::{
     send_confirmation, send_confirmation_request, ConfirmationGate, PendingAction,
 };

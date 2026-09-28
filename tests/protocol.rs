@@ -1025,3 +1025,91 @@ async fn concurrent_loop_turns_handler_panic_into_action_error() {
         .unwrap()
         .unwrap();
 }
+
+async fn next(kernel: &mut VynkorClient) -> Option<envelope::Payload> {
+    tokio::time::timeout(Duration::from_secs(5), kernel.recv())
+        .await
+        .expect("stream stalled")
+        .unwrap()
+        .payload
+}
+
+/// Streams `params_json` back one byte per chunk through the sink (CD-03).
+struct StreamingHandler;
+
+impl ConcurrentHandler for StreamingHandler {
+    fn id(&self) -> &str {
+        "test-streaming"
+    }
+
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            actions: vec!["spell".into()],
+            ..Default::default()
+        }
+    }
+
+    async fn on_action_stream(
+        &self,
+        req: vynkor_sdk::proto::ActionRequest,
+        sink: vynkor_sdk::ResponseSink,
+    ) -> Vec<Envelope> {
+        sink.accept(&req.action_id, Vec::new()).await.unwrap();
+        for (seq, b) in req.params_json.iter().enumerate() {
+            sink.chunk(&req.action_id, seq as u32, vec![*b])
+                .await
+                .unwrap();
+            // a later push must still arrive after an earlier one
+            tokio::task::yield_now().await;
+        }
+        sink.close(&req.action_id, "done").await.unwrap();
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn concurrent_loop_streams_through_response_sink_in_order() {
+    let (plugin_side, kernel_side) = UnixStream::pair().unwrap();
+    let client = VynkorClient::from_stream(plugin_side, None);
+    let mut kernel = VynkorClient::from_stream(kernel_side, None);
+    let loop_task = tokio::spawn(run_concurrent_loop(client, Arc::new(StreamingHandler)));
+
+    let req = Envelope {
+        payload: Some(envelope::Payload::ActionRequest(ActionRequest {
+            action_id: "act-s".into(),
+            action: "spell".into(),
+            params_json: b"abc".to_vec(),
+            timeout_ms: 0,
+            streaming: true,
+            caller_plugin_id: "caller_x".into(),
+        })),
+        ..Default::default()
+    };
+    kernel.send("kernel", req).await.unwrap();
+
+    match next(&mut kernel).await {
+        Some(envelope::Payload::ActionResponse(r)) => {
+            assert_eq!(r.action_id, "act-s");
+            assert_eq!(r.status, ActionStatus::ActionOk as i32);
+        }
+        other => panic!("expected accept first, got {other:?}"),
+    }
+    for (i, want) in b"abc".iter().enumerate() {
+        match next(&mut kernel).await {
+            Some(envelope::Payload::ActionResponseChunk(c)) => {
+                assert_eq!(c.action_id, "act-s");
+                assert_eq!(c.seq, i as u32);
+                assert_eq!(c.chunk, vec![*want]);
+            }
+            other => panic!("expected chunk {i}, got {other:?}"),
+        }
+    }
+    match next(&mut kernel).await {
+        Some(envelope::Payload::SessionClose(c)) => {
+            assert_eq!(c.action_id, "act-s");
+            assert_eq!(c.reason, "done");
+        }
+        other => panic!("expected SessionClose last, got {other:?}"),
+    }
+    loop_task.abort();
+}
