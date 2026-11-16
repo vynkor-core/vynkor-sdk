@@ -16,7 +16,7 @@ vynkor-wire = "0.0.4"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros", "sync"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-prost = "0.13"
+prost = "0.14"
 crc32fast = "1"
 serde_json = "1"
 
